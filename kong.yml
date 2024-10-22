@@ -1,0 +1,86 @@
+_format_version: "3.0"
+services:
+  - name: order-service
+    url: http://order-service:8005
+    routes:
+      - name: order-route
+        paths:
+          - /orders
+        strip_path: false
+
+  - name: user-service
+    url: http://user-service:8006
+    routes:
+      - name: user-route
+        paths:
+          - /users
+        strip_path: false
+
+  - name: product-service
+    url: http://product-service:8003
+    routes:
+      - name: product-route
+        paths:
+          - /products
+        strip_path: false
+
+  - name: inventory-service
+    url: http://inventory-service:8004
+    routes:
+      - name: inventory-route
+        paths:
+          - /inventory
+        strip_path: false
+
+  - name: payment-service
+    url: http://payment-service:8007
+    routes:
+      - name: payment-route
+        paths:
+          - /payments
+        strip_path: false
+
+  - name: notification-service
+    url: http://notification-service:8008
+    routes:
+      - name: notification-route
+        paths:
+          - /notifications
+        strip_path: false
+
+plugins:
+  - name: rate-limiting
+    service: order-service
+    config:
+      minute: 100
+      policy: local
+
+  - name: rate-limiting
+    service: user-service
+    config:
+      minute: 100
+      policy: local
+
+  - name: rate-limiting
+    service: product-service
+    config:
+      minute: 100
+      policy: local
+
+  - name: rate-limiting
+    service: inventory-service
+    config:
+      minute: 100
+      policy: local
+
+  - name: rate-limiting
+    service: payment-service
+    config:
+      minute: 100
+      policy: local
+
+  - name: rate-limiting
+    service: notification-service
+    config:
+      minute: 100
+      policy: local

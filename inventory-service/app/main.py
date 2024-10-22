@@ -1,96 +1,111 @@
-# main.py
-from contextlib import asynccontextmanager
-from typing import Annotated
-from sqlmodel import Session, SQLModel
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status
 from typing import AsyncGenerator
-from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer
 import asyncio
 import json
+from contextlib import asynccontextmanager
+from sqlmodel import SQLModel, Session, create_engine
+from .dependencies import get_session, engine
+from .models import Inventory
+from .schemas import InventoryCreate, InventoryRead, InventoryUpdate
+from .crud import create_inventory, get_inventory, list_inventories, update_inventory, delete_inventory, decrease_inventory, increase_inventory
+from .events import publish_event
+from .settings import BOOTSTRAP_SERVER, KAFKA_INVENTORY_TOPIC
 
-from app import settings
-from app.db_engine import engine
-from app.models.inventory_model import InventoryItem
-from app.crud.inventory_crud import add_new_inventory_item, delete_inventory_item_by_id, get_all_inventory_items, get_inventory_item_by_id
-from app.deps import get_session, get_kafka_producer
-from app.consumers.add_stock_consumer import consume_messages
-
-
-def create_db_and_tables() -> None:
+def create_db_and_tables() ->None:
     SQLModel.metadata.create_all(engine)
+    print("Database and tables created successfully.")  
 
 
-# The first part of the function, before the yield, will
+async def consume_messages(topic: str, bootstrap_servers: str):
+    consumer = AIOKafkaConsumer(
+        topic,
+        bootstrap_servers=bootstrap_servers,
+        group_id="inventory-service-group",
+        auto_offset_reset='earliest'
+    )
+    await consumer.start()
+    try:
+        async for msg in consumer:
+            message = json.loads(msg.value.decode())
+            print(f"Received message: {message} on topic {msg.topic}")
+            # Process the message as needed
+            # Example: If an order is created, decrease inventory
+            if message.get("event") == "order_created":
+                data = message.get("data", {})
+                product_id = data.get("product_id")
+                quantity = data.get("quantity")
+                if product_id and quantity:
+                    with Session(engine) as session:
+                        result = decrease_inventory(session, product_id, quantity)
+                        if result:
+                            await publish_event({"event": "inventory_decreased", "data": result.dict()})
+                        else:
+                            print(f"Insufficient inventory for product_id: {product_id}")
+    finally:
+        await consumer.stop()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    print("Creating tabl...")
-
-    task = asyncio.create_task(consume_messages(
-        "inventory-add-stock-response", 'broker:19092'))
     create_db_and_tables()
-    print("\n\n LIFESPAN created!! \n\n")
+    task = asyncio.create_task(consume_messages(KAFKA_INVENTORY_TOPIC, BOOTSTRAP_SERVER))
     yield
+    task.cancel()
 
-
-app = FastAPI(
-    lifespan=lifespan,
-    title="Hello World API with DB",
-    version="0.0.1",
-)
-
+app = FastAPI(lifespan=lifespan, title="Inventory Service", version="0.1.0")
 
 @app.get("/")
 def read_root():
-    return {"Hello": "Product Service"}
+    return {"Service": "Inventory Service"}
 
+@app.post("/inventory/", response_model=InventoryRead, status_code=status.HTTP_201_CREATED)
+async def create_new_inventory(inventory: InventoryCreate, session: Session = Depends(get_session)):
+    db_inventory = create_inventory(session, inventory)
+    await publish_event({"event": "inventory_created", "data": db_inventory.dict()})
+    return db_inventory
 
-@app.post("/manage-inventory/", response_model=InventoryItem)
-async def create_new_inventory_item(item: InventoryItem, session: Annotated[Session, Depends(get_session)], producer: Annotated[AIOKafkaProducer, Depends(get_kafka_producer)]):
-    """ Create a new inventory item and send it to Kafka"""
+@app.get("/inventory/{inventory_id}", response_model=InventoryRead)
+def read_inventory(inventory_id: int, session: Session = Depends(get_session)):
+    db_inventory = get_inventory(session, inventory_id)
+    if not db_inventory:
+        raise HTTPException(status_code=404, detail="Inventory item not found")
+    return db_inventory
 
-    item_dict = {field: getattr(item, field) for field in item.dict()}
-    item_json = json.dumps(item_dict).encode("utf-8")
-    print("item_JSON:", item_json)
-    # Produce message
-    await producer.send_and_wait("AddStock", item_json)
-    # new_item = add_new_inventory_item(item, session)
-    return item
+@app.get("/inventory/", response_model=list[InventoryRead])
+def read_inventories(session: Session = Depends(get_session)):
+    inventories = list_inventories(session)
+    return inventories
 
+@app.put("/inventory/{inventory_id}", response_model=InventoryRead)
+async def update_existing_inventory(inventory_id: int, inventory_update: InventoryUpdate, session: Session = Depends(get_session)):
+    db_inventory = update_inventory(session, inventory_id, inventory_update)
+    if not db_inventory:
+        raise HTTPException(status_code=404, detail="Inventory item not found")
+    await publish_event({"event": "inventory_updated", "data": db_inventory.dict()})
+    return db_inventory
 
-@app.get("/manage-inventory/all", response_model=list[InventoryItem])
-def all_inventory_items(session: Annotated[Session, Depends(get_session)]):
-    """ Get all inventory items from the database"""
-    return get_all_inventory_items(session)
+@app.delete("/inventory/{inventory_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_existing_inventory(inventory_id: int, session: Session = Depends(get_session)):
+    success = delete_inventory(session, inventory_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Inventory item not found")
+    await publish_event({"event": "inventory_deleted", "data": {"id": inventory_id}})
+    return
 
+@app.post("/inventory/decrease/", status_code=status.HTTP_200_OK)
+async def decrease_inventory_endpoint(product_id: int, quantity: int, session: Session = Depends(get_session)):
+    db_inventory = decrease_inventory(session, product_id, quantity)
+    if not db_inventory:
+        raise HTTPException(status_code=400, detail="Insufficient inventory or product not found")
+    await publish_event({"event": "inventory_decreased", "data": db_inventory.dict()})
+    return {"message": "Inventory decreased successfully", "inventory": db_inventory.dict()}
 
-@app.get("/manage-inventory/{item_id}", response_model=InventoryItem)
-def single_inventory_item(item_id: int, session: Annotated[Session, Depends(get_session)]):
-    """ Get a single inventory item by ID"""
-    try:
-        return get_inventory_item_by_id(inventory_item_id=item_id, session=session)
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/inventory/increase/", status_code=status.HTTP_200_OK)
+async def increase_inventory_endpoint(product_id: int, quantity: int, session: Session = Depends(get_session)):
+    db_inventory = increase_inventory(session, product_id, quantity)
+    if not db_inventory:
+        raise HTTPException(status_code=404, detail="Inventory item not found")
+    await publish_event({"event": "inventory_increased", "data": db_inventory.dict()})
+    return {"message": "Inventory increased successfully", "inventory": db_inventory.dict()}
 
-
-@app.delete("/manage-inventory/{item_id}", response_model=dict)
-def delete_single_inventory_item(item_id: int, session: Annotated[Session, Depends(get_session)]):
-    """ Delete a single inventory item by ID"""
-    try:
-        return delete_inventory_item_by_id(inventory_item_id=item_id, session=session)
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# @app.patch("/manage-inventory/{item_id}", response_model=InventoryItem)
-# def update_single_inventory_item(item_id: int, item: InventoryItemUpdate, session: Annotated[Session, Depends(get_session)]):
-#     """ Update a single inventory item by ID"""
-#     try:
-#         return update_inventory_item_by_id(item_id=item_id, to_update_item_data=item, session=session)
-#     except HTTPException as e:
-#         raise e
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))

@@ -1,71 +1,118 @@
 from fastapi.testclient import TestClient
-from sqlmodel import Field, Session, SQLModel, create_engine, select
-
-# https://sqlmodel.tiangolo.com/tutorial/fastapi/tests/#override-a-dependency
-from app.main import app, get_session, Todo
-
+from sqlmodel import Session, SQLModel, create_engine
+from app.main import app
+from app.dependencies import get_session
+from app.models import Product
+from app.schemas import ProductCreate
 from app import settings
 
-# https://fastapi.tiangolo.com/tutorial/testing/
-# https://realpython.com/python-assert-statement/
-# https://understandingdata.com/posts/list-of-python-assert-statements-for-unit-tests/
+import pytest
 
-# postgresql://ziaukhan:oSUqbdELz91i@ep-polished-waterfall-a50jz332.us-east-2.aws.neon.tech/neondb?sslmode=require
+# Setup test database
+test_engine = create_engine(
+    settings.TEST_DATABASE_URL,
+    connect_args={"sslmode": "require"},
+    pool_recycle=300
+)
+SQLModel.metadata.create_all(test_engine)
 
-def test_read_main()->None:
-    client = TestClient(app=app)
+def get_session_override():
+    with Session(test_engine) as session:
+        yield session
+
+app.dependency_overrides[get_session] = get_session_override
+
+client = TestClient(app)
+
+def test_read_root():
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json() == {"Hello": "World"}
+    assert response.json() == {"Service": "Product Service"}
 
-def test_write_main():
+def test_create_product():
+    product_data = {
+        "name": "Laptop",
+        "description": "A high-performance laptop.",
+        "price": 1500.00,
+        "quantity": 10
+    }
+    response = client.post("/products/", json=product_data)
+    assert response.status_code == 201
+    data = response.json()
+    assert data["name"] == product_data["name"]
+    assert data["description"] == product_data["description"]
+    assert data["price"] == product_data["price"]
+    assert data["quantity"] == product_data["quantity"]
+    assert data["is_active"] == True
 
-    connection_string = str(settings.TEST_DATABASE_URL).replace(
-    "postgresql", "postgresql+psycopg")
+def test_read_products():
+    response = client.get("/products/")
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
 
-    engine = create_engine(
-        connection_string, connect_args={"sslmode": "require"}, pool_recycle=300)
+def test_read_product():
+    # Create a product first
+    product_data = {
+        "name": "Smartphone",
+        "description": "A latest model smartphone.",
+        "price": 800.00,
+        "quantity": 20
+    }
+    create_response = client.post("/products/", json=product_data)
+    assert create_response.status_code == 201
+    created_product = create_response.json()
+    product_id = created_product["id"]
 
-    SQLModel.metadata.create_all(engine)  
+    # Retrieve the created product
+    response = client.get(f"/products/{product_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == product_id
+    assert data["name"] == product_data["name"]
 
-    with Session(engine) as session:  
+def test_update_product():
+    # Create a product first
+    product_data = {
+        "name": "Tablet",
+        "description": "A lightweight tablet.",
+        "price": 300.00,
+        "quantity": 15
+    }
+    create_response = client.post("/products/", json=product_data)
+    assert create_response.status_code == 201
+    created_product = create_response.json()
+    product_id = created_product["id"]
 
-        def get_session_override():  
-                return session  
+    # Update the product's price and quantity
+    update_data = {
+        "price": 350.00,
+        "quantity": 12
+    }
+    response = client.put(f"/products/{product_id}", json=update_data)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["price"] == update_data["price"]
+    assert data["quantity"] == update_data["quantity"]
 
-        app.dependency_overrides[get_session] = get_session_override 
+def test_delete_product():
+    # Create a product first
+    product_data = {
+        "name": "Headphones",
+        "description": "Noise-cancelling headphones.",
+        "price": 200.00,
+        "quantity": 25
+    }
+    create_response = client.post("/products/", json=product_data)
+    assert create_response.status_code == 201
+    created_product = create_response.json()
+    product_id = created_product["id"]
 
-        client = TestClient(app=app)
+    # Delete the product
+    response = client.delete(f"/products/{product_id}")
+    assert response.status_code == 204
 
-        todo_content = "buy bread"
-
-        response = client.post("/todos/",
-            json={"content": todo_content}
-        )
-
-        data = response.json()
-
-        assert response.status_code == 200
-        assert data["content"] == todo_content
-
-def test_read_list_main():
-
-    connection_string = str(settings.TEST_DATABASE_URL).replace(
-    "postgresql", "postgresql+psycopg")
-
-    engine = create_engine(
-        connection_string, connect_args={"sslmode": "require"}, pool_recycle=300)
-
-    SQLModel.metadata.create_all(engine)  
-
-    with Session(engine) as session:  
-
-        def get_session_override():  
-                return session  
-
-        app.dependency_overrides[get_session] = get_session_override 
-        client = TestClient(app=app)
-
-        response = client.get("/todos/")
-        assert response.status_code == 200
-    
+    # Attempt to retrieve the deleted product
+    response = client.get(f"/products/{product_id}")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Product not found"

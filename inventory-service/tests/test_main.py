@@ -1,71 +1,148 @@
 from fastapi.testclient import TestClient
-from sqlmodel import Field, Session, SQLModel, create_engine, select
-
-# https://sqlmodel.tiangolo.com/tutorial/fastapi/tests/#override-a-dependency
-from app.main import app, get_session, Todo
-
+from sqlmodel import Session, SQLModel, create_engine
+from app.main import app
+from app.dependencies import get_session
+from app.models import Inventory
+from app.schemas import InventoryCreate
 from app import settings
 
-# https://fastapi.tiangolo.com/tutorial/testing/
-# https://realpython.com/python-assert-statement/
-# https://understandingdata.com/posts/list-of-python-assert-statements-for-unit-tests/
+import pytest
 
-# postgresql://ziaukhan:oSUqbdELz91i@ep-polished-waterfall-a50jz332.us-east-2.aws.neon.tech/neondb?sslmode=require
+# Setup test database
+test_engine = create_engine(
+    settings.TEST_DATABASE_URL,
+    connect_args={"sslmode": "require"},
+    pool_recycle=300
+)
+SQLModel.metadata.create_all(test_engine)
 
-def test_read_main()->None:
-    client = TestClient(app=app)
+def get_session_override():
+    with Session(test_engine) as session:
+        yield session
+
+app.dependency_overrides[get_session] = get_session_override
+
+client = TestClient(app)
+
+def test_read_root():
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json() == {"Hello": "World"}
+    assert response.json() == {"Service": "Inventory Service"}
 
-def test_write_main():
+def test_create_inventory():
+    inventory_data = {
+        "product_id": 1,
+        "quantity": 50
+    }
+    response = client.post("/inventory/", json=inventory_data)
+    assert response.status_code == 201
+    data = response.json()
+    assert data["product_id"] == inventory_data["product_id"]
+    assert data["quantity"] == inventory_data["quantity"]
+    assert data["is_available"] == True
 
-    connection_string = str(settings.TEST_DATABASE_URL).replace(
-    "postgresql", "postgresql+psycopg")
+def test_read_inventories():
+    response = client.get("/inventory/")
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
 
-    engine = create_engine(
-        connection_string, connect_args={"sslmode": "require"}, pool_recycle=300)
+def test_read_inventory():
+    # Create an inventory item first
+    inventory_data = {
+        "product_id": 2,
+        "quantity": 30
+    }
+    create_response = client.post("/inventory/", json=inventory_data)
+    assert create_response.status_code == 201
+    created_inventory = create_response.json()
+    inventory_id = created_inventory["id"]
 
-    SQLModel.metadata.create_all(engine)  
+    # Retrieve the created inventory
+    response = client.get(f"/inventory/{inventory_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == inventory_id
+    assert data["product_id"] == inventory_data["product_id"]
 
-    with Session(engine) as session:  
+def test_update_inventory():
+    # Create an inventory item first
+    inventory_data = {
+        "product_id": 3,
+        "quantity": 20
+    }
+    create_response = client.post("/inventory/", json=inventory_data)
+    assert create_response.status_code == 201
+    created_inventory = create_response.json()
+    inventory_id = created_inventory["id"]
 
-        def get_session_override():  
-                return session  
+    # Update the inventory's quantity and availability
+    update_data = {
+        "quantity": 25,
+        "is_available": True
+    }
+    response = client.put(f"/inventory/{inventory_id}", json=update_data)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["quantity"] == update_data["quantity"]
+    assert data["is_available"] == update_data["is_available"]
 
-        app.dependency_overrides[get_session] = get_session_override 
+def test_delete_inventory():
+    # Create an inventory item first
+    inventory_data = {
+        "product_id": 4,
+        "quantity": 15
+    }
+    create_response = client.post("/inventory/", json=inventory_data)
+    assert create_response.status_code == 201
+    created_inventory = create_response.json()
+    inventory_id = created_inventory["id"]
 
-        client = TestClient(app=app)
+    # Delete the inventory
+    response = client.delete(f"/inventory/{inventory_id}")
+    assert response.status_code == 204
 
-        todo_content = "buy bread"
+    # Attempt to retrieve the deleted inventory
+    response = client.get(f"/inventory/{inventory_id}")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Inventory item not found"
 
-        response = client.post("/todos/",
-            json={"content": todo_content}
-        )
+def test_decrease_inventory():
+    # Create an inventory item first
+    inventory_data = {
+        "product_id": 5,
+        "quantity": 100
+    }
+    create_response = client.post("/inventory/", json=inventory_data)
+    assert create_response.status_code == 201
 
-        data = response.json()
+    # Decrease inventory
+    decrease_data = {
+        "product_id": 5,
+        "quantity": 20
+    }
+    response = client.post("/inventory/decrease/", params=decrease_data)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["message"] == "Inventory decreased successfully"
+    assert data["inventory"]["quantity"] == 80
 
-        assert response.status_code == 200
-        assert data["content"] == todo_content
+def test_increase_inventory():
+    # Create an inventory item first
+    inventory_data = {
+        "product_id": 6,
+        "quantity": 40
+    }
+    create_response = client.post("/inventory/", json=inventory_data)
+    assert create_response.status_code == 201
 
-def test_read_list_main():
-
-    connection_string = str(settings.TEST_DATABASE_URL).replace(
-    "postgresql", "postgresql+psycopg")
-
-    engine = create_engine(
-        connection_string, connect_args={"sslmode": "require"}, pool_recycle=300)
-
-    SQLModel.metadata.create_all(engine)  
-
-    with Session(engine) as session:  
-
-        def get_session_override():  
-                return session  
-
-        app.dependency_overrides[get_session] = get_session_override 
-        client = TestClient(app=app)
-
-        response = client.get("/todos/")
-        assert response.status_code == 200
-    
+    # Increase inventory
+    increase_data = {
+        "product_id": 6,
+        "quantity": 10
+    }
+    response = client.post("/inventory/increase/", params=increase_data)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["message"] == "Inventory increased successfully"
+    assert data["inventory"]["quantity"] == 50
